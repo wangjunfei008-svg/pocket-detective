@@ -1,6 +1,6 @@
 """口袋小神探：梧桐小学的消失金蛋
 ================================================
-基于 DGX Spark 本地大模型的儿童安全伴学探案游戏
+儿童科学探案游戏。本地模型、云端模型和离线剧本三种方式都能玩。
 魔搭社区「AI+∞ 开发者创作大赛」第三期 · AI 造游戏赛道
 
 启动：streamlit run app.py
@@ -8,9 +8,10 @@
 
 from __future__ import annotations
 
+import html
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import streamlit as st
 
@@ -23,7 +24,12 @@ from agents.characters import (  # noqa: E402
     build_messages,
     build_sparky_messages,
 )
-from agents.game_state import ENERGY_MAX, ChatTurn, GameState  # noqa: E402
+from agents.game_state import (  # noqa: E402
+    ENERGY_MAX,
+    GUILT_CAP_BEFORE_EXPERIMENT,
+    ChatTurn,
+    GameState,
+)
 from assets.avatars import (  # noqa: E402
     avatar_svg,
     egg_svg,
@@ -42,8 +48,9 @@ from engine.llm_client import (  # noqa: E402
 from engine.science_facts import ScienceEngine  # noqa: E402
 
 APP_TITLE = "口袋小神探：梧桐小学的消失金蛋"
-APP_SUBTITLE = "基于 DGX Spark 本地大模型的儿童安全伴学探案游戏 · 6-12 岁 · 15-25 分钟"
+APP_SUBTITLE = "科学教室探案 · 8-12 岁 · 大约 15 分钟"
 STYLE_PATH = os.path.join("assets", "style.css")
+ENDPOINT_CONFIG_ENV = "POCKET_DETECTIVE_ALLOW_ENDPOINT_CONFIG"
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -92,8 +99,88 @@ def inject_css() -> None:
     st.markdown(f"<style>{css}</style>{extra}", unsafe_allow_html=True)
 
 
-def md(html: str, **kwargs: Any) -> None:
-    st.markdown(html, unsafe_allow_html=True, **kwargs)
+def md(html_text: str, **kwargs: Any) -> None:
+    st.markdown(html_text, unsafe_allow_html=True, **kwargs)
+
+
+def esc(value: Any) -> str:
+    """放进 unsafe_allow_html 之前，先把动态文字转成纯文本。"""
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def endpoint_config_enabled() -> bool:
+    """公开页面默认不能改服务器的网址和密钥。大人用环境变量打开。"""
+    return os.environ.get(ENDPOINT_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def case_is_playable(engine: ScienceEngine) -> bool:
+    return bool(engine.suspects()) and bool(engine.items())
+
+
+def privacy_lines(mode: str) -> Dict[str, str]:
+    """按真正在用的后端写隐私说明，不把离线话说成永远成立。"""
+    if mode == MODE_LOCAL:
+        return {
+            "badge": "🏠 对话留在这台电脑上",
+            "detail": "现在用的是你自己电脑上的模型，话不会发到网上。别告诉游戏你的真名、学校和电话。",
+            "parent": "当前是本地模式：对话发到本机的模型服务，不经过作者的服务器。",
+        }
+    if mode == MODE_CLOUD:
+        return {
+            "badge": "☁️ 对话会发给云端模型",
+            "detail": "现在用的是云端模型，话会发到网上。别输入真名、学校、住址或电话。",
+            "parent": "当前是云端模式：对话会发送到你配置的模型服务（例如魔搭或 DashScope）。请使用自己的密钥，并提醒孩子不要输入个人信息。",
+        }
+    return {
+        "badge": "🔌 离线剧本 · 不联网",
+        "detail": "现在是内置剧本，不联网，也不调用大模型。说的话不会发到网上。",
+        "parent": "当前是离线剧本：不需要密钥，也不会把对话发给任何模型服务。",
+    }
+
+
+def bubble_html(text: str, *, kind: str = "suspect", speaker: str = "") -> str:
+    if not text:
+        return ""
+    who_class = {
+        "player": " pd-bubble-who--player",
+        "sparky": " pd-bubble-who--sparky",
+        "system": " pd-bubble-who--system",
+    }.get(kind, "")
+    label = speaker or {"player": "我", "sparky": "鸡飞飞", "system": "旁白"}.get(kind, "")
+    safe = esc(text).replace("\n", "<br/>")
+    chip = f'<span class="pd-bubble-who{who_class}">{esc(label)}</span><br/>' if label else ""
+    return f'<div class="pd-bubble pd-bubble--{esc(kind)}">{chip}{safe}</div>'
+
+
+def victory_card_html(game: GameState) -> str:
+    """通关页只留短句，名字和模型句子都先转义。"""
+    engine = game.engine
+    ending = engine.ending
+    verdict = game.final_verdict or {}
+    confetti = "".join(
+        f'<span class="pd-confetti" style="left:{(i * 7) % 100}%;animation-duration:{2.6 + (i % 5) * 0.7}s;'
+        f'animation-delay:{(i % 7) * 0.35}s">{e}</span>'
+        for i, e in enumerate(["🎉", "⭐", "🥚", "✨", "🎊", "🏅", "🐤", "🧂", "🔦", "🧪", "🍀", "🌟"])
+    )
+    cards = "".join(
+        f'<div class="pd-takeaway"><b>知识点 {index + 1}</b><div>{esc(line)}</div></div>'
+        for index, line in enumerate(ending.get("takeaways") or [])
+    )
+    return (
+        '<div class="pd-victory-overlay">'
+        f"{confetti}"
+        '<div class="pd-victory-card">'
+        f"{medal_svg(size=230)}"
+        f'<div class="pd-victory-title">{esc(ending.get("title", "🏅 通关啦！"))}</div>'
+        f'<div class="pd-victory-sub">恭喜 {esc(game.player_name)}！得分 {int(game.score)} ｜ '
+        f"行动 {int(game.steps)} 次</div>"
+        f"{egg_svg(size=110)}"
+        f'<div class="pd-takeaway"><b>案情真相</b><div>{esc(verdict.get("explanation", ""))}</div></div>'
+        f"{cards}"
+        f'<div class="pd-takeaway"><b>鸡飞飞说</b><div>{esc(ending.get("sparky_bye", ""))}</div></div>'
+        f'<div class="pd-safety">{esc(ending.get("safety_reminder", ""))}</div>'
+        "</div></div>"
+    )
 
 
 # ======================================================================
@@ -118,6 +205,9 @@ def init_state() -> GameState:
 
 
 def new_client(settings: Dict[str, Any]) -> LLMClient:
+    """公开部署忽略侧边栏里的网址和密钥，只认环境变量。"""
+    if not endpoint_config_enabled():
+        return LLMClient()
     mode = settings.get("mode") or "auto"
     explicit = {"local": MODE_LOCAL, "cloud": MODE_CLOUD, "mock": MODE_MOCK}.get(mode)
     return LLMClient(
@@ -126,7 +216,6 @@ def new_client(settings: Dict[str, Any]) -> LLMClient:
         local_base_url=settings.get("local_base_url") or DEFAULT_LOCAL_BASE_URL,
         local_model=settings.get("local_model") or DEFAULT_LOCAL_MODEL,
         cloud_base_url=settings.get("cloud_base_url") or DEFAULT_CLOUD_BASE_URL,
-        # 原样传空串，交给 LLMClient 按 Key 形状选服务商默认模型
         cloud_model=settings.get("cloud_model", ""),
         force_mock=(mode == "mock"),
     )
@@ -152,15 +241,15 @@ def get_client() -> LLMClient:
 # ======================================================================
 #  绘本风 UI 组件
 # ======================================================================
-def render_header(engine: ScienceEngine) -> None:
+def render_header(engine: ScienceEngine, mode: str) -> None:
+    lines = privacy_lines(mode)
     md(
-        f'<div class="pd-title">🕵️ {engine.meta.get("title", APP_TITLE)}</div>'
-        f'<div class="pd-subtitle">{engine.meta.get("subtitle", APP_SUBTITLE)}</div>'
+        f'<div class="pd-title">🕵️ {esc(engine.meta.get("title", APP_TITLE))}</div>'
+        f'<div class="pd-subtitle">{esc(engine.meta.get("subtitle", APP_SUBTITLE))}</div>'
     )
     md(
         '<div class="pd-badge-bar">'
-        '<span class="pd-badge pd-badge--spark">🛡️ NVIDIA DGX Spark 儿童绿色端侧算力守护</span>'
-        '<span class="pd-badge">🔌 100% 离线绿色安全</span>'
+        f'<span class="pd-badge">{esc(lines["badge"])}</span>'
         '<span class="pd-badge pd-badge--privacy">🧒 保护儿童隐私 · 无广告 · 无内购</span>'
         "</div>"
     )
@@ -184,8 +273,8 @@ def render_stage(suspect: Dict[str, Any], mood: str, guilt: int) -> None:
     md(
         '<div class="pd-stage">'
         f'{avatar_svg(who, mood, size=210)}'
-        f'<div class="pd-stage-name">{suspect["emoji"]} {suspect["name"]}</div>'
-        f'<div class="pd-stage-role">{suspect["role"]} · {suspect["age"]}</div>'
+        f'<div class="pd-stage-name">{esc(suspect["emoji"])} {esc(suspect["name"])}</div>'
+        f'<div class="pd-stage-role">{esc(suspect["role"])} · {esc(suspect["age"])}</div>'
         f'<div class="pd-mood-chip{mood_class}">{MOOD_EMOJI.get(mood, "🙂")} {MOOD_LABELS.get(mood, "")}</div>'
         "</div>"
     )
@@ -204,7 +293,7 @@ def render_sparky_card(engine: ScienceEngine, energy: int) -> None:
         '<div class="pd-card pd-card--butter">'
         '<div class="pd-card-title">🐤 口袋伙伴 · 鸡飞飞·斯帕克</div>'
         f'{avatar_svg("sparky", mood, size=150)}'
-        f'<div class="pd-hint" style="text-align:center">{engine.sparky.get("species", "")}</div>'
+        f'<div class="pd-hint" style="text-align:center">{esc(engine.sparky.get("species", ""))}</div>'
         "</div>"
     )
 
@@ -215,16 +304,9 @@ def render_bubble(
     kind: str = "suspect",
     speaker: str = "",
 ) -> None:
-    if not text:
-        return
-    who_class = {
-        "player": " pd-bubble-who--player",
-        "sparky": " pd-bubble-who--sparky",
-        "system": " pd-bubble-who--system",
-    }.get(kind, "")
-    label = speaker or {"player": "我", "sparky": "鸡飞飞", "system": "旁白"}.get(kind, "")
-    chip = f'<span class="pd-bubble-who{who_class}">{label}</span><br/>' if label else ""
-    md(f'<div class="pd-bubble pd-bubble--{kind}">{chip}{text}</div>')
+    html_text = bubble_html(text, kind=kind, speaker=speaker)
+    if html_text:
+        md(html_text)
 
 
 def render_clue_book(game: GameState) -> None:
@@ -239,15 +321,15 @@ def render_clue_book(game: GameState) -> None:
             continue
         star = " ⭐" if clue_id in required else ""
         md(
-            f'<div class="pd-clue"><div class="pd-clue-name">{clue.get("emoji", "🔎")} '
-            f'{clue.get("name", "")}{star}</div>'
-            f'<div class="pd-clue-desc">{clue.get("desc", "")}</div></div>'
+            f'<div class="pd-clue"><div class="pd-clue-name">{esc(clue.get("emoji", "🔎"))} '
+            f'{esc(clue.get("name", ""))}{star}</div>'
+            f'<div class="pd-clue-desc">{esc(clue.get("desc", ""))}</div></div>'
         )
     missing = game.missing_clues()
-    for clue in missing:
+    if missing:
         md(
-            f'<div class="pd-clue pd-clue--locked"><div class="pd-clue-name">❓ 尚未找到：{clue.get("name", "")}</div>'
-            f'<div class="pd-clue-desc">{clue.get("science_hint", "")}</div></div>'
+            f'<div class="pd-clue pd-clue--locked"><div class="pd-clue-name">❓ 还差 {len(missing)} 条关键线索</div>'
+            f'<div class="pd-clue-desc">做对小实验才会出现。这里先不说是什么。</div></div>'
         )
 
 
@@ -262,16 +344,18 @@ def render_sci_backpack(game: GameState) -> None:
             st.session_state.pop("flash", None)
             st.rerun()
         if selected:
-            md(f'<div class="pd-hint" style="margin:-2px 0 6px 4px">{item["usage"]}<br>💡 {item["science_note"]}</div>')
-    md(f'<div class="pd-status"><span class="pd-dot"></span>手上拿着：{game.active_item_label}</div>')
+            md(
+                f'<div class="pd-hint" style="margin:-2px 0 6px 4px">{esc(item["usage"])}<br>💡 {esc(item["science_note"])}</div>'
+            )
+    md(f'<div class="pd-status"><span class="pd-dot"></span>手上拿着：{esc(game.active_item_label)}</div>')
 
 
 def render_scene(game: GameState) -> None:
     engine = game.engine
     scene = engine.scene()
     md('<div class="pd-card pd-card--mint">')
-    md(f'<div class="pd-card-title">{scene.get("emoji", "🔬")} {scene.get("name", "案发现场")}</div>')
-    md(f'<div class="pd-hint">{scene.get("desc", "")}</div>')
+    md(f'<div class="pd-card-title">{esc(scene.get("emoji", "🔬"))} {esc(scene.get("name", "案发现场"))}</div>')
+    md(f'<div class="pd-hint">{esc(scene.get("desc", ""))}</div>')
     md(scene_svg(size=300))
     cols = st.columns(min(4, max(1, len(engine.hotspots()))))
     for index, spot in enumerate(engine.hotspots()):
@@ -281,7 +365,6 @@ def render_scene(game: GameState) -> None:
             if st.button(label, key=f"spot_{spot['id']}", use_container_width=True):
                 event = game.inspect(spot["id"])
                 if event.get("added"):
-                    game.charge(15)
                     st.session_state.flash = (
                         "success",
                         f"🔍 发现线索：{event.get('title', '')}\n\n{event.get('text', '')}",
@@ -299,14 +382,14 @@ def render_fact_card(fact_id: Optional[str], engine: ScienceEngine) -> None:
     fact = engine.fact(fact_id)
     if not fact:
         return
-    steps = "".join(f"<li>{step}</li>" for step in fact.get("experiment_steps") or [])
+    steps = "".join(f"<li>{esc(step)}</li>" for step in fact.get("experiment_steps") or [])
     md(
         '<div class="pd-fact">'
-        f'<div class="pd-fact-title">{fact.get("emoji", "🔬")} 今日科学知识点：{fact.get("title", "")}</div>'
-        f'<div class="pd-fact-body">{fact.get("kid_explanation", "")}</div>'
-        f'<div class="pd-fact-body"><b>在家怎么做（请家长陪同）：</b><ol>{steps}</ol></div>'
-        f'<div class="pd-fact-body"><b>生活里哪里能见到：</b>{fact.get("everyday_example", "")}<br>'
-        f'<b>安全提示：</b>{fact.get("safety_tip", "")}</div>'
+        f'<div class="pd-fact-title">{esc(fact.get("emoji", "🔬"))} {esc(fact.get("title", ""))}</div>'
+        f'<div class="pd-fact-body">{esc(fact.get("kid_explanation", ""))}</div>'
+        f'<div class="pd-fact-body"><b>在家可以这样试（请家长陪同）：</b><ol>{steps}</ol></div>'
+        f'<div class="pd-fact-body"><b>生活里：</b>{esc(fact.get("everyday_example", ""))}<br>'
+        f'<b>安全：</b>{esc(fact.get("safety_tip", ""))}</div>'
         "</div>"
     )
 
@@ -314,7 +397,7 @@ def render_fact_card(fact_id: Optional[str], engine: ScienceEngine) -> None:
 # ======================================================================
 #  侧边栏
 # ======================================================================
-def render_sidebar(game: GameState) -> None:
+def render_sidebar(game: GameState, mode: str) -> None:
     engine = game.engine
     with st.sidebar:
         md('<div class="pd-card pd-card--butter" style="text-align:center">'
@@ -345,8 +428,8 @@ def render_sidebar(game: GameState) -> None:
 
         md('<div class="pd-card pd-card--lilac">')
         render_clue_book(game)
-        md(f'<div class="pd-hint">结案需要 3 条关键线索：已收集 '
-           f'{len([c for c in engine.required_clues() if game.has_clue(c)])} / {len(engine.required_clues())}</div>')
+        found = len([c for c in engine.required_clues() if game.has_clue(c)])
+        md(f'<div class="pd-hint">关键线索：{found} / {len(engine.required_clues())}</div>')
         md("</div>")
 
         md('<div class="pd-card">')
@@ -357,67 +440,98 @@ def render_sidebar(game: GameState) -> None:
             reset_game()
         md("</div>")
 
-        render_compute_panel()
-        md(f'<div class="pd-safety">🛡️ {engine.story.get("safety_note", "")}</div>')
+        render_compute_panel(mode)
+        render_parent_panel(engine, mode)
+        md(f'<div class="pd-safety">{esc(privacy_lines(mode)["detail"])} {esc(engine.story.get("safety_note", ""))}</div>')
 
 
-def render_compute_panel() -> None:
+def render_parent_panel(engine: ScienceEngine, mode: str) -> None:
+    """给家长看的实验清单和隐私说明，默认折起来，不增加孩子的阅读量。"""
+    with st.expander("家长和老师看这里"):
+        st.markdown(privacy_lines(mode)["parent"])
+        st.markdown(engine.story.get("parent_note") or "在家做实验，请大人陪在旁边。")
+        for fact in engine.facts():
+            st.markdown(f"**{fact.get('emoji', '')} {fact.get('title', '')}** · {fact.get('home_level', '必须家长陪同')}")
+            for step in fact.get("experiment_steps") or []:
+                st.markdown(f"- {step}")
+            if fact.get("safety_tip"):
+                st.caption(fact["safety_tip"])
+        st.markdown("本地模型由大人在环境变量里配置。孩子的页面不能填写网址和密钥。")
+
+
+def _render_backend_status(info: Dict[str, Any], *, show_endpoint: bool) -> None:
+    dot = {"dgx_spark_local": "pd-dot", "modelscope_cloud": "pd-dot--cloud", "mock_script": "pd-dot--mock"}[info["mode"]]
+    md(f'<div class="pd-status"><span class="pd-dot {dot}"></span>{esc(info["label"])}</div>')
+    md(f'<div class="pd-hint">{esc(info["detail"])}</div>')
+    if show_endpoint and info.get("model"):
+        md(f'<div class="pd-hint">模型：{esc(info["model"])} ｜ 端点：{esc(info["base_url"])}</div>')
+    if show_endpoint and info.get("error"):
+        md(f'<div class="pd-hint">最近一次提示：{esc(str(info["error"])[:120])}</div>')
+
+
+def render_compute_panel(mode: str) -> None:
     engine = load_engine()
     settings = st.session_state.llm_settings
-    with st.expander("⚙️ 算力双模自适应（DGX Spark / 魔搭云端 / 童趣 Mock）", expanded=False):
-        mode = st.selectbox(
+    if not endpoint_config_enabled():
+        with st.expander("现在用的是哪种回答", expanded=False):
+            client = get_client()
+            _render_backend_status(client.health_check(), show_endpoint=False)
+            md(f'<div class="pd-hint">{esc(privacy_lines(mode)["detail"])}</div>')
+            md(f'<div class="pd-hint">{len(engine.facts())} 个科学知识点。网址和密钥不在这里改。</div>')
+        return
+
+    with st.expander("大人设置：模型与端点", expanded=False):
+        selected = st.selectbox(
             "算力模式",
             ["auto", "local", "cloud", "mock"],
             index=["auto", "local", "cloud", "mock"].index(settings.get("mode", "auto")),
             format_func=lambda key: {
-                "auto": "🤖 自动（本地优先 → 云端 → 童趣 Mock）",
-                "local": "⚡ DGX Spark 本地端侧推理",
-                "cloud": "☁️ 魔搭云端 Qwen",
-                "mock": "🎭 内置童趣智能 Mock 剧本",
+                "auto": "自动（本地优先 → 云端 → 离线剧本）",
+                "local": "本地模型",
+                "cloud": "云端模型",
+                "mock": "离线剧本",
             }[key],
             key="llm_mode",
         )
-        settings["mode"] = mode
-        if mode in ("auto", "cloud", "local"):
+        settings["mode"] = selected
+        if selected in ("auto", "cloud", "local"):
             api_key = st.text_input(
-                "模型服务 API Key（可选，留空则用环境变量或自动 Mock）",
+                "模型服务 API Key（可选，留空则用环境变量或离线剧本）",
                 value=settings.get("api_key", ""),
                 type="password",
                 key="llm_key",
             )
             settings["api_key"] = api_key
-        if mode in ("auto", "local"):
-            settings["local_base_url"] = st.text_input("DGX Spark 端点", value=settings.get("local_base_url"), key="llm_local_url")
+        if selected in ("auto", "local"):
+            settings["local_base_url"] = st.text_input(
+                "本地模型端点", value=settings.get("local_base_url"), key="llm_local_url"
+            )
             settings["local_model"] = st.text_input("本地模型名", value=settings.get("local_model"), key="llm_local_model")
-        if mode in ("auto", "cloud"):
+        if selected in ("auto", "cloud"):
+            settings["cloud_base_url"] = st.text_input(
+                "云端端点（留空则按密钥自动选择）",
+                value=settings.get("cloud_base_url", ""),
+                key="llm_cloud_url",
+            )
             settings["cloud_model"] = st.text_input(
                 "云端模型名（留空自动匹配服务商）",
                 value=settings.get("cloud_model", ""),
                 placeholder="魔搭如 Qwen/Qwen3-32B；DashScope 如 qwen-plus",
                 key="llm_cloud_model",
             )
-        if st.button("🔁 重新探测算力", key="probe_llm", use_container_width=True):
+        if st.button("重新探测", key="probe_llm", use_container_width=True):
             st.session_state.pop("_client_sig", None)
             get_client().refresh()
             st.rerun()
 
         client = get_client()
         info = client.health_check()
-        dot = {"dgx_spark_local": "pd-dot", "modelscope_cloud": "pd-dot--cloud", "mock_script": "pd-dot--mock"}[info["mode"]]
-        md(f'<div class="pd-status"><span class="pd-dot {dot}"></span>{info["label"]}</div>')
-        md(f'<div class="pd-hint">{info["detail"]}</div>')
-        if info.get("model"):
-            md(f'<div class="pd-hint">模型：{info["model"]} ｜ 端点：{info["base_url"]}</div>')
-        if info["mode"] == "dgx_spark_local":
-            md('<div class="pd-hint">⚡ 端侧极速推理，小朋友的对话<b>零数据外泄</b>，全部留在你的 DGX Spark 里。</div>')
-        elif info["mode"] == "mock_script":
-            md('<div class="pd-hint">🎭 当前为内置童趣剧本模式：不联网也能完整通关，评审老师可直接体验全部剧情与三个科学实验。</div>')
-        if info.get("error"):
-            md(f'<div class="pd-hint">最近一次算力提示：{info["error"][:120]}</div>')
+        _render_backend_status(info, show_endpoint=True)
         ready = build_client_signature()
         if ready:
-            md(f'<div class="pd-hint">已检测到环境变量：{ready}</div>')
-        md(f'<div class="pd-hint">案情数据：{len(engine.clues())} 条线索 ｜ {len(engine.facts())} 个科学知识点</div>')
+            md(f'<div class="pd-hint">已检测到环境变量名：{esc(ready)}</div>')
+        md('<div class="pd-hint">本地模式可以接家里的 DGX Spark，或其他 OpenAI 兼容服务。孩子的主界面不放这段说明。</div>')
+        md(f'<div class="pd-hint">{len(engine.clues())} 条线索 ｜ {len(engine.facts())} 个科学知识点</div>')
 
 
 # ======================================================================
@@ -430,11 +544,12 @@ def ask_sparky(game: GameState) -> None:
         "suspect_id": game.active_suspect,
         "collected": game.collected_clues,
         "energy": game.energy,
-        "missing": [c.get("name") for c in game.missing_clues()],
+        "missing_count": len(game.missing_clues()),
         "confessed": game.confessed,
         "guilt": game.guilt,
     }
-    hint = engine.sparky_help(game.active_suspect, game.collected_clues)
+    tier = min(2, len(game.sparky_history))
+    hint = engine.sparky_help(game.active_suspect, game.collected_clues, tier=tier)
     client = get_client()
     if client.backend.mode != MODE_MOCK and question:
         try:
@@ -502,7 +617,13 @@ def render_suspect_tab(game: GameState, suspect: Dict[str, Any]) -> None:
         render_stage(suspect, game.mood_of(suspect_id), game.guilt_of(suspect_id))
         md('<div class="pd-card pd-card--sky" style="margin-top:12px">'
            f'<div class="pd-card-title">🗣️ 他的说辞</div>'
-           f'<div class="pd-hint">{suspect.get("alibi", "")}</div></div>')
+           f'<div class="pd-hint">{esc(suspect.get("alibi", ""))}</div></div>')
+        if (
+            game.guilt_of(suspect_id) >= GUILT_CAP_BEFORE_EXPERIMENT
+            and suspect_id not in game.confessed
+            and not game.experiment_done(suspect_id)
+        ):
+            md('<div class="pd-hint">他已经很慌了。先做对小实验，他才肯把秘密说完。</div>')
         md('<div class="pd-card pd-card--butter">'
            '<div class="pd-card-title">🧪 对他出示道具做小实验</div>'
            '<div class="pd-hint">先从科学小背包选一个道具拿在手里，再点下面的按钮。</div>')
@@ -575,63 +696,32 @@ def render_suspect_tab(game: GameState, suspect: Dict[str, Any]) -> None:
 def render_deduction(game: GameState) -> None:
     engine = game.engine
     md('<div class="pd-card pd-card--butter">')
-    md('<div class="pd-card-title">⚖️ 结案时刻：是谁让金蛋消失的？</div>')
+    md('<div class="pd-card-title">⚖️ 哪一句和证据对得上？</div>')
     if not game.can_deduct:
-        missing = "、".join(c.get("name", "") for c in game.missing_clues())
-        md(f'<div class="pd-hint">还差关键线索：<b>{missing}</b>。先找齐 3 条 ⭐ 关键线索，才能正式指认哦。</div>')
-    md('<div class="pd-hint">提示：三个人都撒了谎，但只有一个人让金蛋<b>真的移动了位置</b>。</div>')
-    cols = st.columns(3)
-    for index, suspect in enumerate(engine.suspects()):
-        with cols[index]:
-            if st.button(
-                f"{suspect['emoji']} 我指认{suspect['name']}",
-                key=f"accuse_{suspect['id']}",
-                use_container_width=True,
-                disabled=not game.can_deduct,
-            ):
-                verdict = game.accuse(suspect["id"])
-                st.session_state.flash = (
-                    "success" if verdict["verdict"] == "correct" else "warning",
-                    verdict.get("feedback", ""),
-                )
-                st.rerun()
+        md(
+            f'<div class="pd-hint">还差 {len(game.missing_clues())} 条关键线索。'
+            "找齐以后，再选一条你能解释的道理。</div>"
+        )
+        md("</div>")
+        return
+    md('<div class="pd-hint">三个人都说过谎。请选一句你能用线索解释的话。</div>')
+    for option in engine.deduction.get("options") or []:
+        if st.button(option.get("label", "这条道理"), key=f"accuse_{option.get('id')}", use_container_width=True):
+            verdict = game.accuse(option.get("id", ""))
+            st.session_state.flash = (
+                "success" if verdict.get("verdict") == "correct" else "warning",
+                verdict.get("feedback", ""),
+            )
+            st.rerun()
     md("</div>")
 
 
 def render_victory(game: GameState) -> None:
-    """全屏通关仪式：勋章 + 三个科学知识点 + 鸡飞飞告别。"""
-    engine = game.engine
-    ending = engine.ending
-    facts = engine.takeaway_facts()
-    confetti = "".join(
-        f'<span class="pd-confetti" style="left:{(i * 7) % 100}%;animation-duration:{2.6 + (i % 5) * 0.7}s;'
-        f'animation-delay:{(i % 7) * 0.35}s">{e}</span>'
-        for i, e in enumerate(["🎉", "⭐", "🥚", "✨", "🎊", "🏅", "🐤", "🧂", "🔦", "🧪", "🍀", "🌟"])
-    )
-    fact_cards = "".join(
-        f'<div class="pd-takeaway"><b>知识点 {index + 1}｜{fact.get("emoji", "")} {fact.get("title", "")}</b>'
-        f'<div>{fact.get("kid_explanation", "")}</div></div>'
-        for index, fact in enumerate(facts)
-    )
-    verdict = game.final_verdict or {}
-    md(
-        '<div class="pd-victory-overlay">'
-        f'{confetti}'
-        '<div class="pd-victory-card">'
-        f'{medal_svg(size=230)}'
-        f'<div class="pd-victory-title">{ending.get("title", "🏅 通关啦！")}</div>'
-        f'<div class="pd-victory-sub">恭喜 {game.player_name}！得分 {game.score} ｜ 行动 {game.steps} 次 ｜ '
-        f'飞船电量 {game.energy}%</div>'
-        f'{egg_svg(size=110)}'
-        f'<div class="pd-takeaway"><b>🔍 案情真相</b><div>{verdict.get("explanation", "")}</div></div>'
-        f'<div class="pd-takeaway"><b>📖 结案故事</b><div>{ending.get("narration", "")}</div></div>'
-        f'{fact_cards}'
-        f'<div class="pd-takeaway"><b>🐤 鸡飞飞说</b><div>{ending.get("sparky_bye", "")}</div></div>'
-        f'<div class="pd-safety">⚠️ {ending.get("safety_reminder", "")}</div>'
-        "</div></div>"
-    )
-    st.markdown('<div style="height:56vh"></div>')
-    col1, col2 = st.columns([1, 3])
+    """通关页：短真相 + 三句知识点。完整故事放在折叠里。"""
+    md(victory_card_html(game))
+    with st.expander("想听完整结局"):
+        st.write(game.engine.ending.get("narration", ""))
+    col1, _col2 = st.columns([1, 3])
     with col1:
         if st.button("🔄 再破一次案", key="again", use_container_width=True):
             reset_game()
@@ -642,23 +732,18 @@ def render_intro(game: GameState) -> None:
     if st.session_state.get("intro_seen"):
         return
     md('<div class="pd-card pd-card--butter">')
-    md('<div class="pd-card-title">📖 第一章 · 会发光的金蛋不见了</div>')
-    md(f'<div class="pd-hint">{engine.story.get("opening", "")}</div>')
-    md(f'<div class="pd-hint" style="margin-top:6px">{engine.story.get("brief", "")}</div>')
-    md("</div>")
-    md('<div class="pd-card pd-card--mint">')
-    md('<div class="pd-card-title">🐤 口袋里的外星搭档</div>')
-    md(f'<div class="pd-hint">{engine.story.get("sparky_intro", "")}</div>')
+    md('<div class="pd-card-title">📖 金蛋不见了</div>')
+    md(f'<div class="pd-hint">{esc(engine.story.get("opening", ""))}</div>')
+    md(f'<div class="pd-hint" style="margin-top:6px">{esc(engine.story.get("brief", ""))}</div>')
+    md(f'<div class="pd-hint" style="margin-top:6px">{esc(engine.story.get("sparky_intro", ""))}</div>')
     md("</div>")
     md('<div class="pd-card pd-card--sky">')
-    md('<div class="pd-card-title">🧭 小侦探攻略（三步破案法）</div>')
+    md('<div class="pd-card-title">🧭 三步</div>')
     md(
         '<div class="pd-hint">'
-        '<b>第一步 勘查现场</b>：点🔍神探放大镜，再点案发现场的四个热点，收齐线索。<br>'
-        '<b>第二步 提问 + 做实验</b>：找三个嫌疑人聊天，把<b>对的道具</b>给<b>对的人</b>——'
-        '🧪碘伏棉签找潘小达的白纸、🔦手电筒照周晓晓的水槽、🧂食用盐袋查张爷爷的盐。'
-        '心虚度满格他就会哭着招供。<br>'
-        '<b>第三步 结案指认</b>：集齐 3 条 ⭐ 关键线索后，在下方指认真正让金蛋移动的人。'
+        "<b>1. 看</b>：拿出放大镜，点现场的四个地方。<br>"
+        "<b>2. 试</b>：选一件道具，给一位同学做实验。没有现象就换人。<br>"
+        "<b>3. 讲</b>：关键线索齐了，选一句你能用证据解释的话。"
         "</div>"
     )
     md("</div>")
@@ -687,9 +772,14 @@ def main() -> None:
     game = init_state()
     engine = game.engine
 
-    render_header(engine)
-    render_sidebar(game)
+    client = get_client()
+    render_header(engine, client.backend.mode)
+    render_sidebar(game, client.backend.mode)
     render_flash()
+
+    if not case_is_playable(engine):
+        st.error("案情没有加载成功。请让大人检查 data/scenario.json 是不是还在。")
+        return
 
     if game.won:
         render_victory(game)
@@ -702,7 +792,7 @@ def main() -> None:
     render_energy(game)
     render_scene(game)
 
-    md('<div class="pd-card-title" style="margin-top:6px">🕵️‍♂️ 找嫌疑人问话（三个都撒了谎）</div>')
+    md('<div class="pd-card-title" style="margin-top:6px">找他们问一问</div>')
     tabs = st.tabs([f"{s['emoji']} {s['name']} · {s['nickname']}" for s in engine.suspects()])
     for tab, suspect in zip(tabs, engine.suspects()):
         with tab:
@@ -710,8 +800,12 @@ def main() -> None:
 
     render_deduction(game)
 
-    md('<div class="pd-safety" style="margin-top:14px">🧪 本游戏所有实验均为虚拟演示；小朋友自己动手做实验时，'
-       "请一定请老师或家长陪同。游戏不收集任何个人信息。</div>")
+    md(
+        '<div class="pd-safety" style="margin-top:14px">'
+        + esc(privacy_lines(client.backend.mode)["detail"])
+        + " 在家做实验，请家长陪同。"
+        "</div>"
+    )
 
 
 if __name__ == "__main__":

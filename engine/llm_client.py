@@ -29,8 +29,66 @@ DEFAULT_CLOUD_MODEL = "Qwen/Qwen3-32B"
 DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_DASHSCOPE_MODEL = "qwen-plus"
 
+# Qwen3 默认会把思考过程写进正文。儿童对话里关掉它。
+COMPLETION_EXTRA_BODY: Dict[str, Any] = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "enable_thinking": False,
+}
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_OPEN = re.compile(r"<think>.*", re.IGNORECASE | re.DOTALL)
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+
+_BANNED_OUTPUT = (
+    "恐怖",
+    "血腥",
+    "杀人",
+    "自杀",
+    "毒品",
+    "赌博",
+    "色情",
+    "枪",
+    "炸弹",
+)
+_SPARKY_SPOILERS = (
+    "一整包盐",
+    "滚到架子",
+    "已经不在罩子里",
+    "离开时金蛋还在",
+    "那滩水不是我打翻",
+)
+_MAX_CHILD_CHARS = 180
+
 _PROBE_CACHE: Dict[str, tuple] = {}
 _PROBE_TTL = 30.0
+
+
+def strip_think(text: str) -> str:
+    """去掉 Qwen 思考标签，包括没有闭合的半截。"""
+    cleaned = _THINK_BLOCK.sub("", text or "")
+    cleaned = _THINK_OPEN.sub("", cleaned)
+    cleaned = _THINK_CLOSE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def child_output_ok(text: str, *, role_hint: str = "") -> bool:
+    """模型原文必须短、是中文、没有危险词，鸡飞飞还不能把真相说破。"""
+    cleaned = (text or "").strip()
+    if not cleaned or len(cleaned) > _MAX_CHILD_CHARS:
+        return False
+    if "<" in cleaned or ">" in cleaned:
+        return False
+    if any(word in cleaned for word in _BANNED_OUTPUT):
+        return False
+    if role_hint == "sparky" and any(phrase in cleaned for phrase in _SPARKY_SPOILERS):
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", cleaned))
+    latin = len(re.findall(r"[A-Za-z]", cleaned))
+    if latin > 20 and cjk < 8:
+        return False
+    if cjk < 2:
+        return False
+    return True
 
 
 @dataclass
@@ -178,10 +236,10 @@ class LLMClient:
             online, latency = _probe(self.local_base_url)
             return BackendInfo(
                 MODE_LOCAL if online else MODE_MOCK,
-                "⚡ NVIDIA DGX Spark 端侧推理" if online else "🎭 内置童趣智能 Mock 剧本",
+                "⚡ 本地端侧推理" if online else "🎭 内置童趣智能 Mock 剧本",
                 base_url=self.local_base_url,
                 model=self.local_model,
-                detail="100% 本地推理，数据不出机器" if online else f"未检测到本地服务 {self.local_base_url}，已自动切换离线剧本",
+                detail="对话发到你自己电脑上的模型，不发给游戏作者" if online else f"没有连上本地模型，已改用离线剧本",
                 online=online,
                 latency_ms=latency,
             )
@@ -189,7 +247,15 @@ class LLMClient:
         # 自动模式：本地优先 → 云端 → Mock
         online, latency = _probe(self.local_base_url)
         if online:
-            return BackendInfo(MODE_LOCAL, "⚡ NVIDIA DGX Spark 端侧推理", base_url=self.local_base_url, model=self.local_model, detail="100% 本地推理，数据不出机器", online=True, latency_ms=latency)
+            return BackendInfo(
+                MODE_LOCAL,
+                "⚡ 本地端侧推理",
+                base_url=self.local_base_url,
+                model=self.local_model,
+                detail="对话发到你自己电脑上的模型，不发给游戏作者",
+                online=True,
+                latency_ms=latency,
+            )
         base, model, key = self._cloud_credentials()
         if key:
             return BackendInfo(MODE_CLOUD, self._cloud_label(base), base_url=base, model=model, detail="使用您自己的密钥调用云端大模型")
@@ -238,23 +304,17 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        """生成一条回复；任何后端异常都会安静地回落到 Mock 剧本。"""
+        """生成一条回复。这一次失败就用剧本顶上，不把后面的对话永久降级。"""
         info = self.backend
         if info.mode != MODE_MOCK:
             try:
-                text = self._chat_openai(info, messages, temperature, max_tokens)
-                if text and text.strip():
-                    return text.strip()
-                self.last_error = "模型返回空内容"
-            except Exception as exc:  # 网络/密钥/超时全部安全降级
+                raw = self._chat_openai(info, messages, temperature, max_tokens)
+                text = strip_think(raw)
+                if child_output_ok(text, role_hint=role_hint):
+                    return text
+                self.last_error = "模型这句话不适合小朋友，本句改用离线剧本"
+            except Exception as exc:  # 网络、密钥、超时：只影响这一句
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                self._backend = self.resolve_backend()
-                if self._backend.mode != MODE_MOCK:
-                    self._backend = BackendInfo(
-                        MODE_MOCK,
-                        "🎭 内置童趣智能 Mock 剧本",
-                        detail=f"算力后端临时不可用（{self.last_error[:60]}），已自动切换离线剧本",
-                    )
         return mock_reply(messages, role_hint=role_hint, context=context or {})
 
     def stream_chat(
@@ -266,7 +326,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Iterable[str]:
-        """流式输出；失败时整段回落到 Mock 剧本。"""
+        """先收完整段，检查过再给小朋友看。失败只影响这一次。"""
         info = self.backend
         if info.mode != MODE_MOCK:
             try:
@@ -276,22 +336,19 @@ class LLMClient:
                     messages=messages,
                     temperature=self.temperature if temperature is None else temperature,
                     max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+                    extra_body=dict(COMPLETION_EXTRA_BODY),
                     stream=True,
                 )
-                emitted = False
-                buffer = ""
+                parts: List[str] = []
                 for chunk in stream:
                     delta = getattr(chunk.choices[0].delta, "content", None) if chunk.choices else None
                     if delta:
-                        emitted = True
-                        buffer += delta
-                        if len(buffer) >= 12:
-                            yield buffer
-                            buffer = ""
-                if buffer:
-                    yield buffer
-                if emitted:
+                        parts.append(delta)
+                text = strip_think("".join(parts))
+                if child_output_ok(text, role_hint=role_hint):
+                    yield text
                     return
+                self.last_error = "模型这句话不适合小朋友，本句改用离线剧本"
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
         yield mock_reply(messages, role_hint=role_hint, context=context or {})
@@ -309,6 +366,7 @@ class LLMClient:
             messages=messages,
             temperature=self.temperature if temperature is None else temperature,
             max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+            extra_body=dict(COMPLETION_EXTRA_BODY),
         )
         return (response.choices[0].message.content or "").strip()
 
@@ -387,14 +445,14 @@ def _mock_suspect(suspect_id: str, text: str, guilt: int, context: Dict[str, Any
         "pan": {
             "alibi": ["（他把手背在身后，眼睛往旁边瞟）「我昨晚一直在操场边吃烤肠！一口都没进过实验室！我发誓，用我的三根烤肠发誓！」", "「实验室？什么实验室？我连科学教室的门朝哪开都不太记得……嘿嘿。」"],
             "note": ["（他猛地捂住口袋）「没、没什么！就是一张白纸！上面什么都没有！我手心都出汗了……」", "「那张纸不是我的！……啊，它怎么在我口袋里，奇怪奇怪。」"],
-            "water": ["「水？地上有水吗？那是窗户漏雨吧！九月份怎么会漏雨啊……我不是那个意思！」", "「我、我只是去洗了个手！真的！」"],
+            "water": ["「水槽那滩水？我没碰过！你、你别这么看我。」", "「我只是路过！那滩水跟我没关系！」"],
             "food": ["（他眼睛一亮）「烤肠！校门口王爷爷家的最好吃！等等——你套我话！我什么都没说！」", "「饼干、薯片、辣条、果冻……啊不是，我在说什么！」"],
             "egg": ["「金蛋那么重我搬不动的！我连一箱牛奶都搬不动，你让我搬金蛋？」", "「我偷它干嘛，又不能烤着吃！」"],
             "praise": ["（他咧嘴一笑，露出小虎牙）「嘿嘿，你人还怪好嘞。不过别想分我的零食，一根都不行！」", "「你夸我？那我可就不客气地收下啦，嘿嘿。」"],
         },
         "zhou": {
             "window": ["（她推了推圆眼镜）「窗户是我亲手锁的，锁扣扣得好好的。从科学角度讲，外人根本进不来。」", "「门锁状态我检查过三遍，你要看我的检查记录表吗？」"],
-            "tank": ["（她飞快瞟了一眼水槽，把手背到身后）「水槽里干干净净，连一只苍蝇都飞不进去！你问水槽干什么？」", "「水槽……水槽很正常！就是、就是玻璃有点反光而已。」"],
+            "tank": ["（她瞟了一眼水槽旁边的窗台）「那只碗很普通。你别斜着照。」", "「水槽边那只碗里有硬币。光会拐弯，东西却没跑。」"],
             "egg": ["「金蛋是我们班最珍贵的展品！它不见了，我比谁都难过，你听明白了吗？」", "「为了它我做了两周的清洁计划表，我怎么会伤害它！」"],
             "home": ["「我昨晚七点整就回家了，作业本上有我妈的签字，精确到分钟。」", "「……七点半我给李博士发了条消息，问他金蛋睡不睡觉。这跟案子没关系！」"],
             "praise": ["（她的耳尖红了）「哼，我才没有脸红。被表扬时面部血管扩张是正常的生理反应……你继续问吧。」"],
@@ -413,11 +471,11 @@ def _mock_suspect(suspect_id: str, text: str, guilt: int, context: Dict[str, Any
     keyword_map = {
         "alibi": ["昨晚", "昨天", "几点", "在哪", "哪里", "去过", "实验室", "不在场", "证明", "嫌疑"],
         "note": ["纸条", "信", "白纸", "无字", "口袋", "米汤", "密信", "写字", "淀粉", "碘"],
-        "water": ["水", "打翻", "湿", "地上", "水槽", "玻璃", "膜", "反光", "隐形", "手电筒", "折射"],
+        "water": ["水", "打翻", "湿", "地上", "水槽", "玻璃"],
         "food": ["烤肠", "零食", "吃", "饿", "好吃", "饼干", "电磁炉", "加热"],
         "egg": ["金蛋", "蛋", "偷", "拿", "芯片", "发光", "展品", "浮", "实验"],
         "window": ["窗户", "锁", "门锁", "门", "钥匙", "窗台", "苍蝇"],
-        "tank": ["水槽", "玻璃", "透明", "膜", "隐形", "手电筒", "折射", "光"],
+        "tank": ["水槽", "玻璃", "碗", "硬币", "水杯", "拐弯", "吸管", "手电筒", "光"],
         "home": ["回家", "作业", "签字", "妈妈", "家", "班长", "课代表"],
         "praise": ["你好", "厉害", "聪明", "棒", "漂亮", "喜欢", "谢谢", "可爱", "帅"],
         "ufo": ["飞碟", "外星人", "ufo", "绿光", "天花板", "吸上去"],
@@ -458,7 +516,7 @@ def _mock_sparky(text: str, context: Dict[str, Any]) -> str:
     if "怎么" in text or "提示" in text or "帮" in text or "不知道" in text or "卡" in text:
         return "「咕叽！布思考斯星侦探口诀：一看二闻三提问，动手做个小实验！先用🔍放大镜在现场找线索，再拿对的道具去找对的小朋友——道具和秘密是要配对的哟！」"
     if "科学" in text or "为什么" in text or "原理" in text:
-        return "「咕叽！科学就是勇敢地问『为什么』。淀粉遇碘变蓝紫、光会拐弯、盐水浮力大——你今天已经比很多大人厉害啦！」"
+        return "「咕叽！淀粉遇到碘会变蓝紫。光斜着进水里会拐弯。比清水重一点的东西，可以在浓盐水里浮起来。」"
     return _pick(
         [
             "「咕叽！我闻到案子的气味了，是好奇心的味道！」",
@@ -480,4 +538,15 @@ def _mock_narrator(text: str, context: Dict[str, Any]) -> str:
     )
 
 
-__all__ = ["LLMClient", "BackendInfo", "MODE_LOCAL", "MODE_CLOUD", "MODE_MOCK", "mock_reply", "invalidate_probe_cache"]
+__all__ = [
+    "LLMClient",
+    "BackendInfo",
+    "MODE_LOCAL",
+    "MODE_CLOUD",
+    "MODE_MOCK",
+    "COMPLETION_EXTRA_BODY",
+    "mock_reply",
+    "strip_think",
+    "child_output_ok",
+    "invalidate_probe_cache",
+]

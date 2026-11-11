@@ -61,6 +61,8 @@ def game(engine: ScienceEngine) -> GameState:
 
 
 def _collect_all_key_clues(game: GameState) -> None:
+    game.select_item("magnifier")
+    game.inspect("hs_rack")
     for suspect_id, item_id in (("pan", "iodine_swab"), ("zhou", "flashlight"), ("zhang", "salt_bag")):
         game.select_item(item_id)
         game.run_experiment(suspect_id)
@@ -71,7 +73,12 @@ def test_scenario_loads_and_is_complete(engine: ScienceEngine) -> None:
     assert [s["id"] for s in engine.suspects()] == ["pan", "zhou", "zhang"]
     assert len(engine.facts()) == 3
     assert [i["id"] for i in engine.items()] == ["magnifier", "iodine_swab", "flashlight", "salt_bag"]
-    assert set(engine.required_clues()) == {"clue_hidden_text", "clue_refilm", "clue_saltbag"}
+    assert set(engine.required_clues()) == {
+        "clue_hidden_text",
+        "clue_coin_bowl",
+        "clue_saltbag",
+        "clue_rack_glow",
+    }
 
 
 def test_every_suspect_has_experiment_and_confession(engine: ScienceEngine) -> None:
@@ -141,7 +148,7 @@ def test_inspect_unknown_hotspot(game: GameState) -> None:
     "suspect_id,item_id,clue_id",
     [
         ("pan", "iodine_swab", "clue_hidden_text"),
-        ("zhou", "flashlight", "clue_refilm"),
+        ("zhou", "flashlight", "clue_coin_bowl"),
         ("zhang", "salt_bag", "clue_saltbag"),
     ],
 )
@@ -203,9 +210,12 @@ def test_guilt_clamps_and_drives_moods(game: GameState) -> None:
     game.add_guilt("pan", 30)
     assert game.mood_of("pan") == MOOD_NERVOUS
     game.add_guilt("pan", 999)
+    assert game.guilt_of("pan") == 55
+    assert "pan" not in game.confessed, "没做实验不能招供"
+    game.solved_experiments.append("clue_hidden_text")
+    game.add_guilt("pan", 999)
     assert game.guilt_of("pan") == MAX_GUILT
     assert game.mood_of("pan") == MOOD_CONFESS
-    assert "pan" in game.confessed
     assert game.add_guilt("pan", -50) == MAX_GUILT, "招供后不能倒退"
 
 
@@ -221,14 +231,16 @@ def test_confession_recorded_once(game: GameState) -> None:
 
 
 def test_pure_questioning_also_triggers_confession(game: GameState) -> None:
-    """实验 + 反复追问可以问满格并招供（不依赖 UI 层补写台词）。"""
+    """实验之后，同一个关键问题只加一次心虚；凑够了才会招供。"""
     game.select_item("iodine_swab")
     game.run_experiment("pan")
     assert game.guilt_of("pan") < MAX_GUILT, "一次实验不该直接问满，孩子还得动嘴"
     for _ in range(6):
         game.ask("pan", "你口袋里那张白纸是什么")
+    assert game.guilt_of("pan") < MAX_GUILT
+    assert "pan" not in game.confessed
+    game.ask("pan", "烤肠好吃吗")
     assert game.guilt_of("pan") == MAX_GUILT
-    assert game.mood_of("pan") == MOOD_CONFESS
     assert any(t.kind == "confession" for t in game.history["pan"])
 
 
@@ -265,20 +277,20 @@ def test_ask_unknown_question_falls_back_to_llm(game: GameState) -> None:
 # ---------------------------------------------------------------- 结案
 def test_cannot_deduct_without_key_clues(game: GameState) -> None:
     assert not game.can_deduct
-    assert len(game.missing_clues()) == 3
+    assert len(game.missing_clues()) == 4
 
 
 def test_wrong_accusation_keeps_game_running(game: GameState) -> None:
     _collect_all_key_clues(game)
-    verdict = game.accuse("pan")
+    verdict = game.accuse("pan_note")
     assert verdict["verdict"] == "wrong" and verdict["feedback"]
-    assert game.stage == "playing" and not game.won
+    assert game.stage == "deduction" and not game.won
     assert game.deduction_attempts == 1
 
 
 def test_correct_accusation_wins_and_awards(game: GameState) -> None:
     _collect_all_key_clues(game)
-    verdict = game.accuse("zhang")
+    verdict = game.accuse("zhang_salt")
     assert verdict["verdict"] == "correct"
     assert game.won and game.energy == ENERGY_MAX
     assert "盐" in verdict["explanation"]
@@ -294,7 +306,7 @@ def test_full_playthrough_is_winnable(game: GameState) -> None:
     for suspect_id in ("pan", "zhou", "zhang"):
         game.add_guilt(suspect_id, 60)
     assert game.can_deduct
-    game.accuse("zhang")
+    game.accuse("zhang_salt")
     assert game.won
     assert len(game.engine.takeaway_facts()) == 3
 
@@ -355,7 +367,7 @@ def test_client_prefers_local_when_reachable(monkeypatch) -> None:
     client = LLMClient()
     client.refresh()
     assert client.backend.mode == MODE_LOCAL
-    assert "DGX Spark" in client.backend.label
+    assert "本地" in client.backend.label
 
 
 # ------------------------------------------------------- 算力探测的严谨性
@@ -445,7 +457,7 @@ def test_cloud_failure_degrades_to_mock_without_raising(monkeypatch) -> None:
         role_hint="suspect",
         context={"suspect_id": "pan"},
     )
-    assert reply and client.backend.mode == MODE_MOCK
+    assert reply and client.backend.mode == MODE_CLOUD
 
 
 def test_stream_chat_falls_back_to_mock() -> None:
@@ -518,7 +530,7 @@ def test_system_prompt_embeds_safety_and_persona(engine: ScienceEngine) -> None:
         prompt = build_system_prompt(suspect)
         assert "儿童内容安全红线" in prompt
         assert suspect["alibi"][:12] in prompt
-        assert "6-12 岁" in CHILD_SAFETY_RULES
+        assert "8-12 岁" in CHILD_SAFETY_RULES
 
 
 def test_build_messages_carries_guilt_and_clues(engine: ScienceEngine) -> None:
@@ -534,7 +546,7 @@ def test_build_messages_carries_guilt_and_clues(engine: ScienceEngine) -> None:
     joined = " ".join(m["content"] for m in messages)
     assert messages[0]["role"] == "system"
     assert "心虚度：70/100" in joined
-    assert "一滩凉凉的清水" in joined
+    assert "水槽边的一滩水" in joined
 
 
 def test_sparky_never_gives_the_answer_away(engine: ScienceEngine) -> None:
@@ -543,14 +555,14 @@ def test_sparky_never_gives_the_answer_away(engine: ScienceEngine) -> None:
         assert "张爷爷是凶手" not in hint and "指认张爷爷" not in hint
         assert len(hint) > 10
     messages = build_sparky_messages(engine.sparky, "是谁偷了金蛋", context={"energy": 50})
-    assert "绝不直接说出" in messages[0]["content"]
+    assert "不要说出是谁让金蛋换了地方" in messages[0]["content"]
 
 
 def test_sparky_help_targets_the_missing_experiment(engine: ScienceEngine) -> None:
     assert "棉签" in engine.sparky_help("pan", [])
     assert "手电筒" in engine.sparky_help("zhou", [])
     assert "盐" in engine.sparky_help("zhang", [])
-    solved = ["clue_hidden_text", "clue_refilm"]
+    solved = ["clue_hidden_text", "clue_coin_bowl"]
     assert "盐" in engine.sparky_help("pan", solved)
 
 
@@ -608,23 +620,27 @@ def _start(at) -> None:
     assert not at.exception, at.exception
 
 
-def test_app_boots_without_exception_and_shows_safety_badge() -> None:
+def test_app_boots_without_exception_and_shows_safety_badge(monkeypatch) -> None:
     """评审零配置点开 Space：不得白屏、不得抛异常，安全勋章必须在场。"""
+    monkeypatch.setenv("POCKET_DETECTIVE_FORCE_MOCK", "1")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(APP_PATH, default_timeout=60).run()
     assert not at.exception, [e.value for e in at.exception]
     assert not at.error, [e.value for e in at.error]
     text = " ".join(m.value for m in at.markdown)
-    for probe in ("DGX Spark", "100% 离线绿色安全", "保护儿童隐私", "科学小背包", "鸡飞飞"):
+    for probe in ("离线剧本", "保护儿童隐私", "科学小背包", "鸡飞飞"):
         assert probe in text, probe
+    assert "100% 离线" not in text
+    assert "API Key" not in " ".join(widget.label for widget in at.text_input)
     labels = [b.label for b in at.button]
     for item in ("🧪 碘伏棉签", "🔦 迷你手电筒", "🧂 食用盐袋", "🔍 神探放大镜"):
         assert item in labels, item
 
 
-def test_full_ui_playthrough_reaches_medal_screen() -> None:
+def test_full_ui_playthrough_reaches_medal_screen(monkeypatch) -> None:
     """从开场到颁发勋章的完整点击路径（纯 Mock 算力，无网络）。"""
+    monkeypatch.setenv("POCKET_DETECTIVE_FORCE_MOCK", "1")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(APP_PATH, default_timeout=60).run()
@@ -649,11 +665,13 @@ def test_full_ui_playthrough_reaches_medal_screen() -> None:
     _click(at, "💬 点击求助鸡飞飞")
     assert game.sparky_history and game.energy > 0
 
-    _click(at, "👦 我指认潘小达")
+    wrong = next(option for option in game.engine.deduction["options"] if option["verdict"] != "correct")
+    right = next(option for option in game.engine.deduction["options"] if option["verdict"] == "correct")
+    _click(at, wrong["label"])
     assert not game.won, "错误指认不能通关"
     assert at.warning, "错误指认要给出鼓励式提示"
 
-    _click(at, "👴 我指认张爷爷")
+    _click(at, right["label"])
     assert game.won
     text = " ".join(m.value for m in at.markdown)
     for probe in ("梧桐街金牌小神探", "知识点 1", "知识点 2", "知识点 3", "淀粉", "折射", "浮力"):
@@ -662,7 +680,8 @@ def test_full_ui_playthrough_reaches_medal_screen() -> None:
     assert not at.exception, [e.value for e in at.exception]
 
 
-def test_wrong_item_shows_no_reaction_but_keeps_playing() -> None:
+def test_wrong_item_shows_no_reaction_but_keeps_playing(monkeypatch) -> None:
+    monkeypatch.setenv("POCKET_DETECTIVE_FORCE_MOCK", "1")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(APP_PATH, default_timeout=60).run()
@@ -675,19 +694,25 @@ def test_wrong_item_shows_no_reaction_but_keeps_playing() -> None:
     assert not at.exception, [e.value for e in at.exception]
 
 
-def test_replay_resets_to_a_fresh_case() -> None:
+def test_replay_resets_to_a_fresh_case(monkeypatch) -> None:
     """通关后「再破一次案」必须回到全新开局（含开场剧情），不能残留上一局线索。"""
+    monkeypatch.setenv("POCKET_DETECTIVE_FORCE_MOCK", "1")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(APP_PATH, default_timeout=60).run()
     _start(at)
     _click(at, "🔍 神探放大镜")
-    _click(at, "💧 水槽边的一滩清水")
+    spot = at.session_state["game"].engine.hotspots()[0]
+    _click(at, f"{spot.get('emoji', '🔎')} {spot.get('name', '')}")
     game = at.session_state["game"]
     assert game.collected_clues, "勘查后应已有线索"
 
     _click(at, "🔄 重新开始破案")
     fresh = at.session_state["game"]
     assert not fresh.collected_clues and fresh.score == 0 and not fresh.won
-    assert not at.session_state.get("intro_seen"), "重开后应重新播放开场剧情"
+    try:
+        seen = at.session_state["intro_seen"]
+    except KeyError:
+        seen = False
+    assert not seen, "重开后应重新播放开场剧情"
     assert not at.exception, [e.value for e in at.exception]

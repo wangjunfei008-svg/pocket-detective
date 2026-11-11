@@ -38,15 +38,23 @@ def load_scenario(path: Optional[str] = None) -> Dict[str, Any]:
         if not isinstance(data, dict) or "suspects" not in data:
             raise ValueError("scenario.json 结构不完整")
         return data
-    except Exception:
-        return _fallback_scenario()
+    except Exception as exc:
+        fallback = _fallback_scenario()
+        fallback.setdefault("meta", {})["load_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return fallback
 
 
 def _fallback_scenario() -> Dict[str, Any]:
     """极端情况下（文件被误删）也能跑通一局的兜底案情。"""
     return {
         "meta": {"title": "口袋小神探：梧桐小学的消失金蛋", "version": "fallback"},
-        "story": {"opening": "科学教室的金蛋不见了。", "brief": "", "sparky_intro": "咕叽！我来帮你！", "safety_note": ""},
+        "story": {
+            "opening": "科学教室的金蛋不见了。",
+            "brief": "",
+            "sparky_intro": "咕叽！我来帮你！",
+            "safety_note": "案情文件没有加载好。",
+            "parent_note": "",
+        },
         "scenes": [{"id": "lab", "name": "科学教室", "emoji": "🔬", "desc": "展台空了。", "hotspots": []}],
         "clues": {},
         "items": [
@@ -238,7 +246,7 @@ class ScienceEngine:
                 OUTCOME_NOTHING,
                 suspect_id,
                 item_id,
-                reply=f"（他紧张地站在原地，你注意到他的小动作）{self._tell_body_language(suspect_id)}",
+                reply=f"（你注意到一个小动作）{self._tell_body_language(suspect_id)}",
                 guilt_delta=6,
                 energy_delta=10,
                 science_fact_id=suspect.get("science_fact_id"),
@@ -255,12 +263,8 @@ class ScienceEngine:
         )
 
     def _tell_body_language(self, suspect_id: str) -> str:
-        cues = {
-            "pan": "他的右手一直按在书包侧袋上，嘴角还有一粒芝麻，鞋尖沾着一点白色粉末。",
-            "zhou": "她的眼镜片上有一小圈指纹，右手食指有被透明胶带粘过的红印子。",
-            "zhang": "他的棉布鞋套上沾着白色粉末，袖口有一小片水渍，胡子上还挂着盐粒。",
-        }
-        return cues.get(suspect_id, "他看起来有点紧张。")
+        suspect = self._suspects.get(suspect_id) or {}
+        return suspect.get("body_language") or "他看起来有点紧张。"
 
     def correct_item_for(self, suspect_id: str) -> Optional[str]:
         suspect = self._suspects.get(suspect_id) or {}
@@ -278,45 +282,71 @@ class ScienceEngine:
         have = set(collected)
         return [self._clues[c] for c in self.required_clues() if c in self._clues and c not in have]
 
-    def judge(self, suspect_id: str) -> Dict[str, Any]:
-        """最终指认判定。"""
+    def judge(self, choice_id: str) -> Dict[str, Any]:
+        """结案判定：必须选中带科学道理的选项，只点人名不算答对。"""
         answer = self.deduction.get("final_answer") or {}
         correct = answer.get("culprit")
-        verdict = "correct" if suspect_id and suspect_id == correct else "wrong"
-        feedback = ""
+        chosen = None
         for option in self.deduction.get("options") or []:
-            if option.get("suspect_id") == suspect_id:
-                feedback = option.get("feedback", "")
+            if option.get("id") == choice_id:
+                chosen = option
                 break
-        if not feedback:
-            feedback = "证据还不够充分，再去现场和小伙伴那里找找线索吧。"
+        if chosen is None:
+            return {
+                "choice_id": choice_id,
+                "suspect_id": choice_id,
+                "verdict": "wrong",
+                "feedback": "要选一条完整的道理。只点一个人的名字，还不能结案。",
+                "correct_suspect": correct,
+                "explanation": "",
+            }
+        verdict = "correct" if chosen.get("verdict") == "correct" else "wrong"
         return {
-            "suspect_id": suspect_id,
+            "choice_id": choice_id,
+            "suspect_id": chosen.get("suspect_id"),
             "verdict": verdict,
-            "feedback": feedback,
+            "feedback": chosen.get("feedback") or "再看看线索，哪一条说明金蛋真的换了地方？",
             "correct_suspect": correct,
             "explanation": answer.get("explanation", "") if verdict == "correct" else "",
+            "fact_id": (self.deduction.get("culprit_by_fact") or {}).get(correct) if verdict == "correct" else None,
         }
 
     # ------------------------------------------------------------------ 求助
-    def sparky_help(self, suspect_id: Optional[str] = None, collected: Optional[List[str]] = None) -> str:
-        """鸡飞飞的童趣提示：优先提示当前缺失的关键实验。"""
+    def _pick_help_line(self, value: Any, tier: int) -> str:
+        """提示分三档：先给现象，再给道理，最后才点工具。"""
+        if isinstance(value, list):
+            if not value:
+                return ""
+            index = max(0, min(int(tier), len(value) - 1))
+            return str(value[index])
+        return str(value or "")
+
+    def sparky_help(
+        self,
+        suspect_id: Optional[str] = None,
+        collected: Optional[List[str]] = None,
+        tier: Optional[int] = None,
+    ) -> str:
+        """鸡飞飞的提示。tier 越小越含蓄；不传则给最具体的一档，方便直接调用。"""
+        if tier is None:
+            tier = 2
         lines = self.sparky.get("help_lines") or {}
-        collected = set(collected or [])
+        collected_set = set(collected or [])
         if suspect_id:
             suspect = self._suspects.get(suspect_id) or {}
             clue_id = (suspect.get("experiment") or {}).get("success_clue")
-            if clue_id and clue_id not in collected:
-                line = lines.get(suspect.get("science_fact_id"))
+            if clue_id and clue_id not in collected_set:
+                line = self._pick_help_line(lines.get(suspect.get("science_fact_id")), tier)
                 if line:
                     return line
-        missing = self.missing_clues(list(collected))
+        missing = self.missing_clues(list(collected_set))
         if missing:
             fact_id = missing[0].get("related_fact")
-            line = lines.get(fact_id)
+            line = self._pick_help_line(lines.get(fact_id), tier)
             if line:
                 return line
-        return lines.get("general", "咕叽！一看二闻三提问，动手做个小实验！")
+        general = self._pick_help_line(lines.get("general"), tier)
+        return general or "咕叽！先看现场，再做小实验。"
 
     def sparky_charge(self, index: int = 0) -> str:
         lines = self.sparky.get("charge_lines") or ["咕叽！好奇心能量 +100！"]

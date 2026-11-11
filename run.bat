@@ -33,7 +33,8 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] 启动成功！请用浏览器打开： http://%HOST%:%PORT%
-echo       - 不填任何 API Key 也能完整通关（自动使用内置童趣剧本）
+echo       - 不填任何 API Key 也能完整通关（自动使用内置离线剧本）
+echo       - 公开页面请设置 POCKET_DETECTIVE_FORCE_MOCK=1，不要打开端点设置
 echo       - DGX Spark 本地推理：先启动本地服务，再在左侧栏选择算力模式
 echo       - 教室平板访问： set HOST=0.0.0.0 ^&^& run.bat
 echo       - 关闭游戏：在本窗口按 Ctrl+C

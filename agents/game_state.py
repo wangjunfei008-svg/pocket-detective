@@ -19,6 +19,8 @@ STAGE_WON = "won"
 
 MAX_GUILT = 100
 ENERGY_MAX = 100
+# 没做对这个人的实验之前，心虚度到这里就停住，不能靠刷问题招供。
+GUILT_CAP_BEFORE_EXPERIMENT = 55
 
 
 @dataclass
@@ -65,6 +67,8 @@ class GameState:
         self.confessed: List[str] = []
         self.guilt: Dict[str, int] = {s["id"]: 0 for s in self.engine.suspects()}
         self.moods: Dict[str, str] = {s["id"]: MOOD_NORMAL for s in self.engine.suspects()}
+        self.asked_topics: Dict[str, set] = {s["id"]: set() for s in self.engine.suspects()}
+        self.observed_with_magnifier: set = set()
         self.history: Dict[str, List[ChatTurn]] = {s["id"]: [] for s in self.engine.suspects()}
         self.sparky_history: List[ChatTurn] = []
         self.journal: List[str] = []
@@ -101,11 +105,12 @@ class GameState:
             return False
         self.collected_clues.append(clue_id)
         self.score += 30
-        self._gain_energy(15)
         fact_id = clue.get("related_fact")
         if fact_id and fact_id not in self.facts_learned:
             self.facts_learned.append(fact_id)
         self.journal.append(f"📌 收录线索：{clue.get('emoji', '')} {clue.get('name', '')}")
+        if self.stage == STAGE_PLAYING and self.engine.can_deduct(self.collected_clues):
+            self.stage = STAGE_DEDUCTION
         return True
 
     def clue_objects(self) -> List[Dict[str, Any]]:
@@ -146,12 +151,19 @@ class GameState:
         suspect = self.engine.suspect(suspect_id) or {}
         self.steps += 1
         topic = self._match_topic(suspect, question)
+        asked = self.asked_topics.setdefault(suspect_id, set())
         if topic:
             reply = topic.get("reply", "")
-            delta = int(topic.get("guilt_delta", 0))
+            topic_id = topic.get("id")
+            if topic_id and topic_id in asked:
+                delta = 0
+            else:
+                if topic_id:
+                    asked.add(topic_id)
+                delta = int(topic.get("guilt_delta", 0))
         else:
             reply = ""
-            delta = 5
+            delta = 0
         fact_id = suspect.get("science_fact_id")
         mood = self.mood_of(suspect_id)
         turn = ChatTurn(role="player", text=question, speaker=self.player_name, suspect_id=suspect_id, mood=mood)
@@ -181,7 +193,11 @@ class GameState:
             mood=self.moods.get(suspect_id, MOOD_NORMAL),
             fact_id=fact_id,
         )
-        self.history.setdefault(suspect_id, []).append(turn)
+        history = self.history.setdefault(suspect_id, [])
+        if history and history[-1].kind == "confession" and kind != "confession":
+            history.insert(len(history) - 1, turn)
+        else:
+            history.append(turn)
         return turn
 
     def _match_topic(self, suspect: Dict[str, Any], question: str) -> Optional[Dict[str, Any]]:
@@ -204,18 +220,26 @@ class GameState:
             return self.last_event
         self.steps += 1
         result = self.engine.experiment(suspect_id, item_id, already_solved=self.solved_experiments)
+        guilt_delta = int(result.guilt_delta)
+        energy_delta = int(result.energy_delta)
+        if item_id == "magnifier":
+            if suspect_id in self.observed_with_magnifier:
+                guilt_delta = 0
+                energy_delta = 0
+            else:
+                self.observed_with_magnifier.add(suspect_id)
         added = False
         if result.success:
             added = self.add_clue(result.clue_id or "")
             if result.clue_id and result.clue_id not in self.solved_experiments:
                 self.solved_experiments.append(result.clue_id)
-            self._gain_energy(result.energy_delta)
+            self._gain_energy(energy_delta)
             self.score += 80
             if result.science_fact_id and result.science_fact_id not in self.facts_learned:
                 self.facts_learned.append(result.science_fact_id)
             self.journal.append(f"🧪 小实验成功：{self.engine.item_label(item_id)} → {(self.engine.clue(result.clue_id) or {}).get('name', '')}")
-        elif result.outcome == "nothing" and result.guilt_delta:
-            self._gain_energy(result.energy_delta)
+        elif result.outcome == "nothing" and energy_delta:
+            self._gain_energy(energy_delta)
         # 先呈现实验反应，再结算心虚度：心虚度满格时招供台词才会排在实验之后
         self.push_turn(
             suspect_id,
@@ -230,10 +254,10 @@ class GameState:
                 fact_id=result.science_fact_id,
             ),
         )
-        if result.success:
-            self.add_guilt(suspect_id, result.guilt_delta)
-        elif result.outcome == "nothing" and result.guilt_delta:
-            self.add_guilt(suspect_id, result.guilt_delta)
+        if result.success and guilt_delta:
+            self.add_guilt(suspect_id, guilt_delta)
+        elif result.outcome == "nothing" and guilt_delta:
+            self.add_guilt(suspect_id, guilt_delta)
         self.last_event = {
             "type": "experiment",
             "outcome": result.outcome,
@@ -256,13 +280,22 @@ class GameState:
         return self.last_event
 
     # ------------------------------------------------------------ 心虚度
+    def experiment_done(self, suspect_id: str) -> bool:
+        suspect = self.engine.suspect(suspect_id) or {}
+        clue_id = (suspect.get("experiment") or {}).get("success_clue")
+        return bool(clue_id and clue_id in self.solved_experiments)
+
     def add_guilt(self, suspect_id: str, delta: int) -> int:
         current = self.guilt.get(suspect_id, 0)
         if suspect_id in self.confessed:
             self.guilt[suspect_id] = MAX_GUILT
             self.moods[suspect_id] = MOOD_CONFESS
             return MAX_GUILT
-        current = max(0, min(MAX_GUILT, current + int(delta)))
+        current = max(0, current + int(delta))
+        if self.experiment_done(suspect_id):
+            current = min(MAX_GUILT, current)
+        else:
+            current = min(GUILT_CAP_BEFORE_EXPERIMENT, current)
         self.guilt[suspect_id] = current
         self.moods[suspect_id] = mood_from_guilt(current, confessed=current >= MAX_GUILT)
         if current >= MAX_GUILT:
@@ -275,9 +308,13 @@ class GameState:
             return
         self.confessed.append(suspect_id)
         suspect = self.engine.suspect(suspect_id) or {}
-        confession = (suspect.get("experiment") or {}).get("confession", "") or "「好吧，我全招了……」"
+        experiment = suspect.get("experiment") or {}
+        confession = experiment.get("confession", "") or "「好吧，我说实话……」"
         self.record_reply(suspect_id, confession, kind="confession", fact_id=suspect.get("science_fact_id"))
-        self.journal.append(f"🙇 {suspect.get('name', '')} 心虚度满格，哇地哭出来招供了！")
+        bonus = experiment.get("confession_clue")
+        if bonus:
+            self.add_clue(bonus)
+        self.journal.append(f"🙇 {suspect.get('name', '')} 把自己的那件事说出来了。")
         self.score += 60
         self._gain_energy(25)
 
@@ -303,19 +340,28 @@ class GameState:
     def missing_clues(self) -> List[Dict[str, Any]]:
         return self.engine.missing_clues(self.collected_clues)
 
-    def accuse(self, suspect_id: str) -> Dict[str, Any]:
+    def accuse(self, choice_id: str) -> Dict[str, Any]:
+        if not self.can_deduct:
+            self.last_event = {
+                "type": "accuse",
+                "verdict": "locked",
+                "feedback": "关键线索还没齐。先做完小实验，再来选道理。",
+                "attempts": self.deduction_attempts,
+            }
+            return self.last_event
         self.deduction_attempts += 1
-        verdict = self.engine.judge(suspect_id)
+        verdict = self.engine.judge(choice_id)
         verdict["attempts"] = self.deduction_attempts
         if verdict.get("verdict") == "correct":
             self.stage = STAGE_WON
             self.final_verdict = verdict
             self.score += 300
             self.energy = ENERGY_MAX
-            self.journal.append("🏅 案情大白！金蛋回到展台，梧桐街金牌小神探勋章颁发！")
+            self.journal.append("🏅 案情说通了！金蛋回到展台。")
         else:
-            self.energy = max(0, self.energy - 10)
-            self.journal.append("🤔 指认被驳回，再去找找证据吧。")
+            self.energy = max(0, self.energy - 15)
+            self.score = max(0, self.score - 20)
+            self.journal.append("🤔 这条道理和证据对不上，再想想。")
         self.last_event = {"type": "accuse", **verdict}
         return self.last_event
 
@@ -345,4 +391,13 @@ class GameState:
         }
 
 
-__all__ = ["GameState", "ChatTurn", "STAGE_PLAYING", "STAGE_DEDUCTION", "STAGE_WON", "MAX_GUILT", "ENERGY_MAX"]
+__all__ = [
+    "GameState",
+    "ChatTurn",
+    "STAGE_PLAYING",
+    "STAGE_DEDUCTION",
+    "STAGE_WON",
+    "MAX_GUILT",
+    "ENERGY_MAX",
+    "GUILT_CAP_BEFORE_EXPERIMENT",
+]
