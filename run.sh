@@ -23,7 +23,8 @@ fi
 
 echo ""
 echo "🎉 启动成功！请用浏览器打开： http://${HOST}:${PORT}"
-echo "   · 未配置任何 Key 也能完整通关（自动进入内置童趣 Mock 剧本）"
+echo "   · 未配置任何 Key 也能完整通关（自动进入内置离线剧本）"
+echo "   · 公开页面请加 POCKET_DETECTIVE_FORCE_MOCK=1，不要打开端点设置"
 echo "   · DGX Spark 本地推理：先启动 OpenAI 兼容服务，再在侧边栏选「DGX Spark 本地端侧推理」"
 echo "   · 想让教室里的平板也能访问：HOST=0.0.0.0 ./run.sh"
 echo "   · 跑单元测试： $PYTHON -m pytest tests -q"
